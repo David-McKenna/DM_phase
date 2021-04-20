@@ -18,6 +18,7 @@ import scipy.signal
 from scipy.fftpack import fft, ifft
 from scipy.stats import norm
 
+from tqdm import tqdm
 
 plt.rcParams['toolbar'] = 'None'
 plt.rcParams['keymap.yscale'] = 'Y'
@@ -984,7 +985,7 @@ def get_dm(waterfall, dm_list, t_res, f_channels, ref_freq="top",
     nbin = waterfall.shape[1] // 2
     power_spectra = np.zeros([nbin, dm_list.size])
 
-    for i, dm in enumerate(dm_list):
+    for i, dm in enumerate(tqdm(dm_list)):
         waterfall_dedisp = dedisperse_waterfall(
             waterfall,
             dm,
