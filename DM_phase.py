@@ -620,7 +620,8 @@ def poly_max(x, y, err, w='None'):
 
 
 def plot_power(dm_map, low_idx, up_idx, X, Y, plot_range, returns_poly, x, y,
-                t_res, snr=None, fname="", blackonwhite=False, fformat=".pdf"):
+                t_res, snr=None, fname="", blackonwhite=False, fformat=".pdf",
+                ref_dm=0.):
     """Diagnostic plot of coherent power vs dispersion measure."""
     if low_idx==0:
         low_idx=1
@@ -642,10 +643,10 @@ def plot_power(dm_map, low_idx, up_idx, X, Y, plot_range, returns_poly, x, y,
 
     if snr is None:
         title = "{0:}\nBest DM = {1:.3f} $\pm$ {2:.3f}".format(
-            fname, returns_poly[0], returns_poly[1])
+            fname, returns_poly[0] + ref_dm, returns_poly[1])
     else:
         title = "{0:}\nBest DM = {1:.3f} $\pm$ {2:.3f}\nS/N = {3:.1f}".format(
-            fname, returns_poly[0], returns_poly[1], snr)
+            fname, returns_poly[0] + ref_dm, returns_poly[1], snr)
     fig.suptitle(title, color=fg_color, linespacing=1.5)
 
     # Profile
@@ -753,7 +754,8 @@ def check_window(profile, window):
 
 
 def plot_waterfall(returns_poly, waterfall, dt, f, cutoff, fname="",
-                    window=None, blackonwhite=False, fformat=".pdf"):
+                    window=None, blackonwhite=False, fformat=".pdf",
+                    ref_dm=0.):
     """Plot the waterfall at the best Dispersion Measure and at close
     values for comparison.
 
@@ -772,7 +774,7 @@ def plot_waterfall(returns_poly, waterfall, dt, f, cutoff, fname="",
     grid = gridspec.GridSpec(1, 3, wspace=0.1)
 
     title = "{0:}\nBest DM = {1:.3f} $\\pm$ {2:.3f}".format(
-        fname, returns_poly[0], returns_poly[1])
+        fname, returns_poly[0] + ref_dm, returns_poly[1])
     plt.suptitle(title, color=fg_color, linespacing=1.5)
 
     # DMs +/- 5 sigmas away
@@ -811,7 +813,7 @@ def plot_waterfall(returns_poly, waterfall, dt, f, cutoff, fname="",
         y = profile[window[0]:window[1]]
         ax_prof.plot(x, y, fg_color, linewidth=0.5, clip_on=False)
         ax_prof.axis('off')
-        ax_prof.set_title('{0:.3f}'.format(dm), color=fg_color)
+        ax_prof.set_title('{0:.3f}'.format(dm + ref_dm), color=fg_color)
 
         # waterfall
         im = wfall[:, window[0]:window[1]]
@@ -921,11 +923,80 @@ def from_PSRCHIVE(fname, dm_s, dm_e, dm_step, ref_freq="top",
 
     return dm, dm_std
 
+def from_SIGPROC(fname, dm_s, dm_e, dm_step, ref_freq="top",
+                  manual_cutoff=False, manual_bandwidth=False, no_plots=False,
+                  start_sample=0, end_sample=0, buffer_samples=0, zap=[]):
+    """Brute-force search of the dispersion measure of a single pulse
+    stored into a PSRCHIVE file. The algorithm uses phase information
+    and is robust to interference and unusual burst shapes.
+
+    Parameters
+    ----------
+    fname : str
+        Name of a PSRCHIVE file.
+    dm_s : float
+        Starting value of dispersion measure to search, in pc/cc.
+    dm_e : float
+        Ending value of dispersion measure to search, in pc/cc.
+    dm_step : float
+        Step of the search, in pc/cc.
+
+    Returns
+    -------
+    dm : float
+        Best value of Dispersion Measure (pc/cc).
+    dm_std :
+        Standard deviation of the Dispersion Measure (pc/cc)
+
+    Stores
+    ------
+    basename(fname) + "_Waterfall_5sig.pdf" : plot
+        Pulse waterfall at the best Dispersion Measure and 5 sigmas away
+    basename(fname) + "_DM_Search.pdf": plot
+        Map of the coherent power as a function of the search Dispersion
+        Measure.
+
+    """
+    spr = sigpyproc.FilReader(fname)
+    t_res = spr.header.tsamp
+    bw_channel = spr.header.foff
+
+    if end_sample:
+        end_sample += spr.header.getDMdelays(dm_e)[-1] + buffer_samples
+    else:
+        end_sample = spr.header.nsamples
+
+    if start_sample:
+        start_sample -= buffer_samples
+
+    print(f"Loading sigproc data from {fname}...")
+    waterfall = spr.readBlock(start_sample, end_sample - start_sample).dedisperse(dm_s, True).normalise()
+    waterfall[zap, :] = 1.
+    print(waterfall.shape)
+
+    if bw_channel < 0:
+        bw_channel *= -1
+        waterfall = waterfall[-1::-1]
+        f_channels = spr.header.fbottom + bw_channel * np.arange(spr.header.nchans)
+    else:
+        f_channels = spr.header.ftop + bw_channel * np.arange(spr.header.nchans)
+
+    dm_list = np.arange(np.float(dm_s - dm_s), np.float(dm_e - dm_s), np.float(dm_step))
+
+    print("Calling get_dm...")
+    dm, dm_std = get_dm(waterfall, dm_list, t_res, f_channels,
+                        ref_freq=ref_freq, manual_cutoff=manual_cutoff,
+                        manual_bandwidth=manual_bandwidth,
+                        fname=os.path.basename(fname), no_plots=no_plots,
+                        ref_dm=dm_s)
+
+    return dm, dm_std
+
 
 def get_dm(waterfall, dm_list, t_res, f_channels, ref_freq="top",
            manual_cutoff=False, manual_bandwidth=False, fname="",
            no_plots=False, blackonwhite=False, fformat=".pdf",
-           ff_cutoff=None, time_lim=None):
+           ff_cutoff=None, time_lim=None, ref_dm=0., max_samples=0):
     """Brute-force search of the Dispersion Measure of a waterfall numpy
     matrix. The algorithm uses phase information and is robust to
     interference and unusual burst shapes.
@@ -959,6 +1030,8 @@ def get_dm(waterfall, dm_list, t_res, f_channels, ref_freq="top",
         Indices for the cutoff of the fluctuation frequency
     time_lim : list , optional. Default: None
         Indices for the time limits of the pulse profile
+    ref_dm : float, optional. Default: 0
+        Flag that the input waterfall has already been dedispersed to the given DM
 
     Returns
     -------
@@ -985,7 +1058,9 @@ def get_dm(waterfall, dm_list, t_res, f_channels, ref_freq="top",
     nbin = waterfall.shape[1] // 2
     power_spectra = np.zeros([nbin, dm_list.size])
 
-    for i, dm in enumerate(tqdm(dm_list)):
+    pbar = tqdm(dm_list)
+    for i, dm in enumerate(pbar):
+        pbar.set_description("DEDISP")
         waterfall_dedisp = dedisperse_waterfall(
             waterfall,
             dm,
@@ -993,6 +1068,7 @@ def get_dm(waterfall, dm_list, t_res, f_channels, ref_freq="top",
             t_res,
             ref_freq=ref_freq
         )
+        pbar.set_description("POWERS")
         power_spectrum = get_coherent_power_spectrum(waterfall_dedisp)
         power_spectra[:, i] = power_spectrum[: nbin]
 
@@ -1044,7 +1120,8 @@ def get_dm(waterfall, dm_list, t_res, f_channels, ref_freq="top",
         blackonwhite = blackonwhite,
         weight = snr,
         dstd = dstd,
-        snr = snr.max()
+        snr = snr.max(),
+        ref_dm = ref_dm
     )
     return dm, dm_std
 
@@ -1052,7 +1129,7 @@ def get_dm(waterfall, dm_list, t_res, f_channels, ref_freq="top",
 def dm_calculation(waterfall, power_spectra, dpower_spectra, dm_curve, low_idx, up_idx,
                     f_channels, t_res, dm_list, no_plots=False, fname="",
                     phase_lim=None, blackonwhite=False, fformat=".pdf",
-                    weight=None,dstd=None, snr=None):
+                    weight=None,dstd=None, snr=None,ref_dm=0.):
     """Calculate the best DM value."""
     fact_idx = up_idx - low_idx
     nchan = len(f_channels)
@@ -1089,12 +1166,12 @@ def dm_calculation(waterfall, power_spectra, dpower_spectra, dm_curve, low_idx, 
     if not no_plots:
         plot_power(power_spectra, low_idx, up_idx, dm_list, dm_curve,
                     plot_range, returns_poly, x, y, t_res, snr=snr, fname=fname,
-                    fformat=fformat, blackonwhite=blackonwhite)
+                    fformat=fformat, blackonwhite=blackonwhite, ref_dm=ref_dm)
         plot_waterfall(returns_poly, waterfall, t_res, f_channels, fact_idx,
                         fname=fname, fformat=fformat, window=phase_lim,
-                        blackonwhite=blackonwhite)
+                        blackonwhite=blackonwhite, ref_dm=ref_dm)
 
-    dm = returns_poly[0]
+    dm = returns_poly[0] + ref_dm
     dm_std = returns_poly[1]
 
     return dm, dm_std
@@ -1131,20 +1208,62 @@ def get_parser():
     parser.add_argument(
         "-no_plots", help="Do not produce diagnostic plots.",
         action='store_true')
-
+    parser.add_argument(
+        "-start_sample", help = "Sigproc Reader: Starting time sample",
+        default = 0, type = int)
+    parser.add_argument(
+        "-end_sample", help = "Sigproc Reader: Final time sample (excluding dedispersion)",
+        default = 0, type = int)
+    parser.add_argument(
+        "-buffer_samples", help = "Sigproc Reader: Number of buffer samples before / after final time sample (excluding dedispersion)",
+        default = 0, type = int)
+    parser.add_argument(
+        "-zap", help = "Sigproc reader: Zap selected channels",
+        default = '', type = str)
     return parser.parse_args()
 
+def parse_list(inp):
+    ret = []
+    for split in inp.split(','):
+        if ':' in split:
+            start, end = split.split(':')
+            ret += list(range(int(start), int(end)))
+        else:
+            ret += [int(split)]
+
+    return ret
 
 if __name__ == "__main__":
     args = get_parser()
-    import psrchive
-    dm, dm_std = from_PSRCHIVE(
-        args.fname,
-        args.DM_s,
-        args.DM_e,
-        args.DM_step,
-        ref_freq = args.ref_freq,
-        manual_cutoff = args.manual_cutoff,
-        manual_bandwidth = args.manual_bandwidth,
-        no_plots=args.no_plots
-    )
+    if '.fil' in args.fname:
+        zap = parse_list(args.zap)
+        import sigpyproc
+        dm, dm_std = from_SIGPROC(
+            args.fname,
+            args.DM_s,
+            args.DM_e,
+            args.DM_step,
+            ref_freq = args.ref_freq,
+            manual_cutoff = args.manual_cutoff,
+            manual_bandwidth = args.manual_bandwidth,
+            no_plots=args.no_plots,
+            start_sample = args.start_sample,
+            end_sample = args.end_sample,
+            buffer_samples = args.buffer_samples,
+            zap = zap
+        )
+
+    else:
+        import psrchive
+        dm, dm_std = from_PSRCHIVE(
+            args.fname,
+            args.DM_s,
+            args.DM_e,
+            args.DM_step,
+            ref_freq = args.ref_freq,
+            manual_cutoff = args.manual_cutoff,
+            manual_bandwidth = args.manual_bandwidth,
+            no_plots=args.no_plots
+        )
+
+    print(f"DM: {dm}\nSTD: {dm_std}")
